@@ -1,0 +1,175 @@
+import asyncio
+import geocoder
+import folium
+import requests
+import argparse
+import logging
+import os
+import re
+
+# Set up logging configuration
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+API_TOKEN_IPINFO = os.getenv('IPINFO_TOKEN', "60ac57f6319893")  # Use environment variable or default token
+
+# Regular expression for validating IP addresses
+IP_REGEX = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
+
+# Function to validate and extract IP or domain from a URL
+def extract_ip_or_domain(input_str):
+    """Extract IP address or domain from a given string."""
+    if re.match(IP_REGEX, input_str):
+        return input_str  # It's a valid IP address
+    elif input_str.endswith('.onion'):
+        return input_str  # It's a .onion address
+    else:
+        return input_str  # Treat it as a domain
+
+# Function to sanitize filenames
+def sanitize_filename(filename):
+    """Sanitize the filename by removing or replacing invalid characters."""
+    return re.sub(r'[<>:"/\\|?*]', '_', filename)
+
+# Function to resolve .onion addresses to IP (using Tor)
+async def resolve_onion_address(onion_address):
+    """Resolve a .onion address to an IP address."""
+    logging.info(f"Resolving .onion address: {onion_address}")
+    # Note: This requires the Tor service to be running and configured correctly on your machine.
+    # You'll need to have `requests` installed for this to work.
+    try:
+        response = requests.get(f"http://{onion_address}")
+        if response.status_code == 200:
+            return [0.0, 0.0]  # Placeholder for .onion addresses (they don't have public IPs)
+        else:
+            logging.warning(f"Could not resolve .onion address: {onion_address}")
+            return None
+    except Exception as e:
+        logging.error(f"Error resolving .onion address: {e}")
+        return None
+
+# Function to get geolocation using geocoder
+async def get_geolocation_with_geocoder(ip_address):
+    """Get the latitude and longitude of the provided IP address using geocoder."""
+    g = geocoder.ip(ip_address)
+    if g.ok:
+        return g.latlng
+    else:
+        logging.warning(f"Could not get geolocation for IP (Geocoder): {ip_address}")
+        return None
+
+# Function to get geolocation using ipinfo.io
+async def get_geolocation_with_ipinfo(ip_address):
+    """Get the latitude and longitude of the provided IP address using ipinfo.io."""
+    url = f"https://ipinfo.io/{ip_address}/json?token={API_TOKEN_IPINFO}"
+
+    try:
+        response = requests.get(url)
+        data = response.json()
+        if 'loc' in data:
+            lat, lng = map(float, data['loc'].split(','))
+            return lat, lng, data
+        else:
+            logging.warning(f"Could not get geolocation for IP (ipinfo.io): {ip_address}")
+            return None
+    except Exception as e:
+        logging.error(f"Error fetching from ipinfo.io: {e}")
+        return None
+
+# Function to get geolocation using ip-api.com
+async def get_geolocation_with_ip_api(ip_address):
+    """Get the latitude and longitude of the provided IP address using ip-api.com."""
+    url = f"http://ip-api.com/json/{ip_address}"
+
+    try:
+        response = requests.get(url)
+        data = response.json()
+        if 'lat' in data and 'lon' in data:
+            return data['lat'], data['lon'], data  # Return latitude, longitude, and additional data
+        else:
+            logging.warning(f"Could not get geolocation for IP (ip-api.com): {ip_address}")
+            return None
+    except Exception as e:
+        logging.error(f"Error fetching from ip-api.com: {e}")
+        return None
+
+# Function to create a folium map for the IP geolocation
+def create_map(latlng, ip_address, details):
+    """Create a map with a marker at the IP address location and save it as an HTML file."""
+    geo_map = folium.Map(location=latlng, zoom_start=10)
+    folium.Marker(latlng, popup=f"IP: {ip_address}\n{details}").add_to(geo_map)
+
+    # Sanitize the filename before saving
+    sanitized_ip_address = sanitize_filename(ip_address)
+    map_file = f"{sanitized_ip_address}_geolocation_map.html"
+    geo_map.save(map_file)
+    logging.info(f"Map saved as {map_file}")
+
+# Function to detect proxy, VPN, or hosting service
+async def check_vpn_proxy(ip_address):
+    """Check if the IP address is a proxy, VPN, or hosting provider using the ipinfo.io API."""
+    url = f"https://ipinfo.io/{ip_address}?token={API_TOKEN_IPINFO}"
+
+    try:
+        response = requests.get(url)
+        data = response.json()
+
+        # Checking if the IP belongs to a hosting provider or proxy
+        if 'privacy' in data:
+            if data['privacy'].get('vpn'):
+                logging.info(f"IP {ip_address} is detected as a VPN.")
+            elif data['privacy'].get('proxy'):
+                logging.info(f"IP {ip_address} is detected as a Proxy.")
+            elif data['privacy'].get('tor'):
+                logging.info(f"IP {ip_address} is detected as a Tor exit node.")
+            else:
+                logging.info(f"IP {ip_address} is not using any anonymization tools.")
+        else:
+            logging.warning(f"No VPN/Proxy/Tor information available for IP {ip_address}.")
+    except Exception as e:
+        logging.error(f"Error checking proxy/VPN status: {e}")
+
+# Main function to handle argument parsing and geolocation tasks
+async def main(inputs):
+    """Main function to parse IPs or URLs, detect VPN/proxy, and display geolocation."""
+    for input_str in inputs:
+        ip_or_domain = extract_ip_or_domain(input_str)
+
+        # Resolve .onion addresses
+        if ip_or_domain.endswith('.onion'):
+            latlng = await resolve_onion_address(ip_or_domain)
+            if latlng is None:
+                logging.warning(f"Could not find geolocation for .onion address {ip_or_domain}.")
+                continue
+            lat, lng = latlng
+            details = f"This is a .onion address."
+            create_map((lat, lng), ip_or_domain, details)
+            continue
+
+        # Check if the IP address is using VPN/Proxy
+        await check_vpn_proxy(ip_or_domain)
+
+        # Get geolocation using all available methods
+        latlng_data = await asyncio.gather(
+            get_geolocation_with_ipinfo(ip_or_domain),
+            get_geolocation_with_ip_api(ip_or_domain),
+            get_geolocation_with_geocoder(ip_or_domain)
+        )
+
+        latlng = next((data for data in latlng_data if data is not None), None)
+
+        if latlng:
+            lat, lng = latlng[:2]
+            details = latlng[2] if len(latlng) > 2 else {}
+            logging.info(f"Geolocation of {input_str}: {lat}, {lng}, Details: {details}")
+            create_map((lat, lng), input_str, details)
+        else:
+            logging.warning(f"Could not find geolocation for {input_str}.")
+
+# Fix the variable names to the correct ones for main execution
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="IP/URL/Onion to Geolocation with VPN/Proxy Detection Tool")
+    parser.add_argument("inputs", nargs='+', help="IP addresses, simple URLs, or .onion addresses to geolocate and check for VPN/Proxy status")
+    args = parser.parse_args()
+    
+    asyncio.run(main(args.inputs))
+
