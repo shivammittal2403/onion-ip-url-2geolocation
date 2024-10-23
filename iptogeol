@@ -1,0 +1,97 @@
+import requests
+import re
+import argparse
+import logging
+
+# Set up logging configuration
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# API Tokens (replace these with your actual tokens)
+API_TOKEN_IPINFO = "your_ipinfo_token_here"
+API_KEY_IPSTACK = "your_ipstack_key_here"
+
+# Regular expression for validating IP addresses
+IP_REGEX = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
+
+def is_valid_ip(ip_address):
+    """Validate the format of an IP address."""
+    return re.match(IP_REGEX, ip_address) is not None
+
+def get_geolocation_ipinfo(ip_address):
+    """Get geolocation from ipinfo.io."""
+    url = f"https://ipinfo.io/{ip_address}/json?token={API_TOKEN_IPINFO}"
+    response = requests.get(url)
+    if response.status_code == 200:
+        data = response.json()
+        if 'loc' in data:
+            lat, lon = map(float, data['loc'].split(','))
+            return {'source': 'ipinfo.io', 'lat': lat, 'lon': lon}
+    logging.warning(f"ipinfo.io: Could not get geolocation for IP {ip_address}")
+    return None
+
+def get_geolocation_ip_api(ip_address):
+    """Get geolocation from ip-api.com."""
+    url = f"http://ip-api.com/json/{ip_address}"
+    response = requests.get(url)
+    if response.status_code == 200:
+        data = response.json()
+        if 'lat' in data and 'lon' in data:
+            return {'source': 'ip-api.com', 'lat': data['lat'], 'lon': data['lon']}
+    logging.warning(f"ip-api.com: Could not get geolocation for IP {ip_address}")
+    return None
+
+def get_geolocation_ipstack(ip_address):
+    """Get geolocation from ipstack.com."""
+    url = f"http://api.ipstack.com/{ip_address}?access_key={API_KEY_IPSTACK}"
+    response = requests.get(url)
+    if response.status_code == 200:
+        data = response.json()
+        if 'latitude' in data and 'longitude' in data:
+            return {'source': 'ipstack.com', 'lat': data['latitude'], 'lon': data['longitude']}
+    logging.warning(f"ipstack.com: Could not get geolocation for IP {ip_address}")
+    return None
+
+def average_geolocations(locations):
+    """Average multiple geolocation results."""
+    lat_sum = 0
+    lon_sum = 0
+    count = len(locations)
+
+    for location in locations:
+        lat_sum += location['lat']
+        lon_sum += location['lon']
+
+    return {
+        'lat': lat_sum / count,
+        'lon': lon_sum / count
+    }
+
+def main(ip_address):
+    """Main function to get and print geolocation of an IP address."""
+    if not is_valid_ip(ip_address):
+        logging.error("Invalid IP address format.")
+        return
+
+    logging.info(f"Getting geolocation for: {ip_address}")
+
+    # Collect geolocation results
+    locations = []
+    for func in [get_geolocation_ipinfo, get_geolocation_ip_api, get_geolocation_ipstack]:
+        result = func(ip_address)
+        if result:
+            locations.append(result)
+
+    if locations:
+        avg_location = average_geolocations(locations)
+        logging.info(f"Averaged Location: Latitude: {avg_location['lat']}, Longitude: {avg_location['lon']}")
+        for loc in locations:
+            logging.info(f"Source: {loc['source']}, Lat: {loc['lat']}, Lon: {loc['lon']}")
+    else:
+        logging.error(f"Could not find geolocation for: {ip_address}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='IP Geolocation Finder')
+    parser.add_argument('ip_address', help='IP address to geolocate')
+    args = parser.parse_args()
+    main(args.ip_address)
+

@@ -1,0 +1,268 @@
+import asyncio
+import geocoder
+import folium
+import requests
+import argparse
+import logging
+import os
+import re
+import numpy as np  # For numerical operations
+
+# Set up logging configuration
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# API Tokens
+API_TOKEN_IPINFO = "60ac57f6319893"  # Default token, change to your actual token
+API_KEY_IPSTACK = "395e5569d430e0a202da6efe0cd07490"  # Add your IPStack key
+API_KEY_IPGEOLOCATION = "5f46393b4b1d49bca2f4bfea0371361d"  # Add your IPGeolocation key
+
+# Regular expression for validating IP addresses
+IP_REGEX = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
+
+# Function to validate and extract IP or domain from a URL
+def extract_ip_or_domain(input_str):
+    """Extract IP address or domain from a given string."""
+    if re.match(IP_REGEX, input_str):
+        return input_str  # It's a valid IP address
+    elif input_str.endswith('.onion'):
+        return input_str  # It's a .onion address
+    else:
+        return input_str  # Treat it as a domain
+
+# Function to sanitize filenames
+def sanitize_filename(filename):
+    """Sanitize the filename by removing or replacing invalid characters."""
+    return re.sub(r'[<>:"/\\|?*]', '_', filename)
+
+# Function to get geolocation using different APIs with weighted averaging
+async def get_geolocation(ip_address):
+    """Get the latitude and longitude of the provided IP address using multiple APIs with weighted averaging."""
+    tasks = [
+        get_geolocation_with_ipinfo(ip_address),
+        get_geolocation_with_ipstack(ip_address),
+        get_geolocation_with_ip_api(ip_address),
+        get_geolocation_with_ipgeolocation(ip_address),
+        get_geolocation_with_dbip(ip_address),
+        get_geolocation_with_geocoder(ip_address)
+    ]
+
+    # Run geolocation tasks concurrently
+    latlng_results = await asyncio.gather(*tasks)
+
+    # Filter out None results
+    valid_results = [result for result in latlng_results if result is not None]
+    
+    # Log results
+    for result in valid_results:
+        logging.info(f"Geolocation from {result['source']}: Lat {result['lat']}, Lng {result['lng']}")
+
+    # Apply weighted averaging
+    if valid_results:
+        total_lat = 0
+        total_lng = 0
+        total_weight = 0
+        for result in valid_results:
+            weight = 1  # Default weight; can be adjusted based on source reliability
+            if result['source'] == 'ipinfo.io':
+                weight = 3  # Higher weight for more reliable source
+            elif result['source'] == 'IPStack':
+                weight = 2  # Medium weight
+            total_lat += result['lat'] * weight
+            total_lng += result['lng'] * weight
+            total_weight += weight
+            
+        avg_lat = total_lat / total_weight
+        avg_lng = total_lng / total_weight
+        return {
+            'lat': avg_lat,
+            'lng': avg_lng,
+            'details': valid_results
+        }
+    else:
+        logging.warning(f"Could not find geolocation for {ip_address}")
+        return None
+
+# Function to get geolocation using geocoder
+async def get_geolocation_with_geocoder(ip_address):
+    """Get the latitude and longitude of the provided IP address using geocoder."""
+    g = geocoder.ip(ip_address)
+    if g.ok:
+        return {'source': 'geocoder', 'lat': g.latlng[0], 'lng': g.latlng[1], 'accuracy': None}
+    else:
+        logging.warning(f"Could not get geolocation for IP (Geocoder): {ip_address}")
+        return None
+
+# Function to get geolocation using ipinfo.io
+async def get_geolocation_with_ipinfo(ip_address):
+    """Get the latitude and longitude of the provided IP address using ipinfo.io."""
+    url = f"https://ipinfo.io/{ip_address}/json?token={API_TOKEN_IPINFO}"
+
+    try:
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        if 'loc' in data:
+            lat, lng = map(float, data['loc'].split(','))
+            return {
+                'source': 'ipinfo.io',
+                'lat': lat,
+                'lng': lng,
+                'accuracy': None,
+                'details': data
+            }
+        else:
+            logging.warning(f"Could not get geolocation for IP (ipinfo.io): {ip_address}")
+            return None
+    except Exception as e:
+        logging.error(f"Error fetching from ipinfo.io: {e}")
+        return None
+
+# Function to get geolocation using ip-api.com
+async def get_geolocation_with_ip_api(ip_address):
+    """Get the latitude and longitude of the provided IP address using ip-api.com."""
+    url = f"http://ip-api.com/json/{ip_address}"
+
+    try:
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        if 'lat' in data and 'lon' in data:
+            return {
+                'source': 'ip-api.com',
+                'lat': data['lat'],
+                'lng': data['lon'],
+                'accuracy': data.get('status', None),
+                'details': data
+            }
+        else:
+            logging.warning(f"Could not get geolocation for IP (ip-api.com): {ip_address}")
+            return None
+    except Exception as e:
+        logging.error(f"Error fetching from ip-api.com: {e}")
+        return None
+
+# Function to get geolocation using db-ip.com
+async def get_geolocation_with_dbip(ip_address):
+    """Get the latitude and longitude of the provided IP address using db-ip.com."""
+    api_key = 'your_dbip_key_here'  # Change to your DB-IP API key
+    url = f"https://api.db-ip.com/v2/{api_key}/{ip_address}"
+
+    try:
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        if 'latitude' in data and 'longitude' in data:
+            return {
+                'source': 'db-ip.com',
+                'lat': data['latitude'],
+                'lng': data['longitude'],
+                'accuracy': None,
+                'details': data
+            }
+        else:
+            logging.warning(f"Could not get geolocation for IP (db-ip.com): {ip_address}")
+            return None
+    except Exception as e:
+        logging.error(f"Error fetching from db-ip.com: {e}")
+        return None
+
+# Function to get geolocation using IPStack
+async def get_geolocation_with_ipstack(ip_address):
+    """Get the latitude and longitude of the provided IP address using IPStack."""
+    url = f"http://api.ipstack.com/{ip_address}?access_key={API_KEY_IPSTACK}"
+
+    try:
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        if 'latitude' in data and 'longitude' in data:
+            return {
+                'source': 'IPStack',
+                'lat': data['latitude'],
+                'lng': data['longitude'],
+                'accuracy': data.get('accuracy', None),
+                'details': data
+            }
+        else:
+            logging.warning(f"Could not get geolocation for IP (IPStack): {ip_address}")
+            return None
+    except Exception as e:
+        logging.error(f"Error fetching from IPStack: {e}")
+        return None
+
+# Function to get geolocation using IPGeolocation.io
+async def get_geolocation_with_ipgeolocation(ip_address):
+    """Get the latitude and longitude of the provided IP address using IPGeolocation.io."""
+    url = f"https://api.ipgeolocation.io/ipgeo?apiKey={API_KEY_IPGEOLOCATION}&ip={ip_address}"
+
+    try:
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        if 'latitude' in data and 'longitude' in data:
+            return {
+                'source': 'IPGeolocation.io',
+                'lat': data['latitude'],
+                'lng': data['longitude'],
+                'accuracy': None,
+                'details': data
+            }
+        else:
+            logging.warning(f"Could not get geolocation for IP (IPGeolocation.io): {ip_address}")
+            return None
+    except Exception as e:
+        logging.error(f"Error fetching from IPGeolocation.io: {e}")
+        return None
+
+# Function to create a map
+def create_map(lat, lng, ip_address, details):
+    """Create a folium map for the given latitude and longitude."""
+    logging.info(f"Creating map for {ip_address}: Lat {lat}, Lng {lng}")
+    map_obj = folium.Map(location=[lat, lng], zoom_start=12)
+    folium.Marker([lat, lng], popup=ip_address).add_to(map_obj)
+
+    # Add additional information in the popup
+    details_info = "\n".join([f"{detail['source']}: {detail['lat']}, {detail['lng']}" for detail in details])
+    folium.Marker([lat, lng], popup=f"{ip_address}<br>{details_info}").add_to(map_obj)
+
+    # Save map to HTML file
+    filename = sanitize_filename(f"{ip_address}_map.html")
+    map_obj.save(filename)
+    logging.info(f"Map saved to {filename}")
+
+async def main(input_string):
+    """Main function to handle input and initiate geolocation."""
+    # Extract IP or domain
+    ip_or_domain = extract_ip_or_domain(input_string)
+
+    # Resolve .onion addresses if needed
+    if ip_or_domain.endswith('.onion'):
+        logging.info(f"Detected .onion address: {ip_or_domain}")
+        latlng = await resolve_onion_address(ip_or_domain)
+        if latlng:
+            lat, lng = latlng
+            create_map(lat, lng, ip_or_domain, [])
+            return
+        else:
+            logging.warning(f"Could not resolve .onion address: {ip_or_domain}")
+            return
+
+    # Validate the IP address format
+    if not re.match(IP_REGEX, ip_or_domain) and not ip_or_domain.endswith('.onion'):
+        logging.error(f"Invalid IP address or domain: {input_string}")
+        return
+
+    # Get geolocation
+    logging.info(f"Getting geolocation for: {ip_or_domain}")
+    geolocation = await get_geolocation(ip_or_domain)
+
+    if geolocation:
+        lat = geolocation['lat']
+        lng = geolocation['lng']
+        create_map(lat, lng, ip_or_domain, geolocation['details'])
+    else:
+        logging.error(f"Geolocation could not be determined for: {ip_or_domain}")
+
+# CLI argument parsing
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Geolocation Finder')
+    parser.add_argument('input_string', help='IP address or domain name to geolocate')
+    args = parser.parse_args()
+
+    asyncio.run(main(args.input_string))
+
